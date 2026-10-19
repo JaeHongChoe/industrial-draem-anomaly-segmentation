@@ -1,289 +1,195 @@
-# Semiconductor Parts Anomaly Segmentation
+# 반도체 부품 이상 영역 분할 (DRAEM Anomaly Segmentation)
 
-반도체 부품 이미지에서 결함 후보를 분할하고 제품 단위 불량 판정을 보조하기 위한 이상 탐지 파이프라인입니다.
+정상 이미지 위주로 학습해, 흑백(grayscale) 반도체 부품 이미지에서 결함이 의심되는 위치를 픽셀 단위 확률맵으로 표시하는 이상 탐지 파이프라인입니다.
 
-이 저장소는 `원본 이미지 전처리 → 결함 패치 추출 → 정상 이미지 기반 재구성 모델 학습 → 가성 결함 패치 기반 분할 학습 → 추론 / 시각화`
-흐름을 한곳에서 볼 수 있도록 정리한 코드 묶음입니다. 실제 이미지와 라벨 데이터는 보안상 포함하지 않습니다.
+## 한눈에 보기
 
-핵심 목적은 **정상 샘플로 깨끗한 이미지를 재구성하고, 실제 결함 패치와 가성 결함 패치를 정상 이미지에 합성해 결함 위치를 분할하도록 학습시키는 것**입니다.
+- **문제**: 정상 이미지는 많고 결함 이미지는 매우 적어, 결함 라벨로 학습하는 일반적인 지도학습이 어려움
+- **접근**: DRAEM. 정상 이미지에 가짜 결함을 합성하고, "복원 모델 + 결함 위치 분할 모델"을 함께 학습
+- **결과물**: 픽셀별 결함 확률맵, 4분할 시각화 PNG (Input / Recon / Prob / Result), image·pixel 단위 AUC/AP CSV
+- **기술 스택**: Python, PyTorch, OpenCV, imgaug, scikit-learn, TensorBoard (후속 실험: timm DINOv3)
+- **포함**: 전처리 → 결함 패치 추출 → 학습 → 추론/시각화 코드, 후속 실험 `experiments/tile_v4/`
+- **미포함**: 실제 이미지·라벨·학습된 체크포인트·성능 수치 (보안상 비공개)
 
-## Project Snapshot
+## 왜 필요한가
 
-- Domain: 반도체 부품 비전 검사 / 결함 탐지
-- Problem: 결함 샘플이 적고 제품 종류가 다양해, 단일 제품·단일 모델 가정의 방법론을 그대로 쓰기 어려움
-- Approach: DRAEM의 "정상 재구성 + 합성 결함 분할" 학습 아이디어를 가져오되, 다품종 단일 모델 환경에 맞춰 AE 기반 재구성 구조와 결함 패치 합성 로직을 구성
-- Output: anomaly probability map, input/reconstruction/probability/overlay 4분할 시각화, image/pixel 단위 평가 지표
-- Scope: 공개 가능한 코드 구조와 학습/평가 흐름 정리. 실제 데이터와 체크포인트는 포함하지 않음
+검사 현장에서는 정상 부품 이미지는 계속 쌓이지만, 결함 이미지는 드물고 모양도 제각각입니다.
+결함 사진을 많이 모아 "이것이 결함"이라고 가르치는 지도학습은 샘플 부족과 결함 분포 치우침 때문에 학습이 불안정했습니다.
+그래서 모델에게는 "정상이 어떻게 생겼는지"를 배우게 하고, 학습 중에는 정상 이미지 위에 가짜 결함을 직접 만들어 붙여 위치 찾기를 연습시킵니다.
+소량의 실제 결함 라벨은 정답 데이터가 아니라 "가짜 결함 재료"로만 사용하므로, 결함 데이터가 적어도 픽셀 단위 분할 모델을 학습할 수 있습니다.
 
-## What to Review First
-
-평가자가 빠르게 구조를 보려면 아래 파일부터 보면 됩니다.
-
-1. `preprocess/pipeline.py`  
-   X-ray/비전 이미지의 FFT central-crop, 노이즈 제거, 대비 보정, sharpening 등 공용 전처리 흐름입니다.
-
-2. `preprocess/extract_defect_patches.py`  
-   LabelMe polygon annotation을 alpha mask가 포함된 결함 패치로 변환합니다.
-
-3. `data_loader_black.py`  
-   정상 이미지 위에 실제 결함 패치 또는 합성 결함을 배치해 학습용 image/mask pair를 생성합니다.
-
-4. `model.py`, `model_unet.py`  
-   정상 이미지 재구성용 AE 계열 모델과 anomaly mask 분할용 U-Net 계열 모델입니다.
-
-5. `train.py`, `test.py`  
-   학습, checkpoint/resume, TensorBoard 시각화, AUC/AP 계산, 4분할 결과 저장까지 이어지는 실행 엔트리입니다.
-
-## 접근 배경
-
-이 파이프라인이 해결하려는 문제와 단계별 논리는 다음과 같습니다.
-
-- 대상 데이터는 저조도 계열의 단일 채널 (grayscale) 이미지이고, 정상 이미지는 많지만 결함 이미지는 매우 제한적이었습니다.
-- 일반적인 Supervised 방식으로는 결함 샘플 부족 + 결함 분포 치우침으로 인해 학습이 불안정했습니다.
-- DRAEM (Discriminatively trained Reconstruction Anomaly Embedding Model) 을 기반으로,
-  - AutoEncoder 에게는 정상 이미지 재구성만 학습시키고,
-  - Segmentation U-Net 에게는 "원본 vs 재구성" 차이에서 anomaly mask 를 뽑도록 학습시키는 2-스테이지 구조를 도입했습니다.
-- 결함 합성은 50% 실제 결함 patch (LabelMe 어노테이션에서 추출) + 50% Perlin noise 를 원본에 블렌딩해 사용하도록 구성했습니다.
-
-대표 구성:
-
-- Reconstruction: `AE_high` (1→32→64→128→256→512→1024 encoder, symmetric decoder).
-- Discriminative: `DiscriminativeSubNetwork` (U-Net, 2-channel 입력 → anomaly mask).
-- Loss: `MSE + SSIM + Focal Loss`.
-- Scheduler: `ReduceLROnPlateau` (validation SSIM loss 기준).
-
-## 이 폴더의 범위
-
-이 폴더에는 아래 단계가 포함됩니다.
-
-1. 원본 이미지 FFT central-crop + 후처리 전처리
-2. 학습 / 검증 split 및 augmentation 생성
-3. LabelMe JSON 으로부터 결함 patch (alpha mask 포함) 추출
-4. DRAEM AutoEncoder + U-Net 학습 / 재개 / 체크포인트 관리
-5. 추론 + 결과 시각화 (Input / Recon / Prob / Overlay 4 분할 이미지)
-
-## 중요 전제
-
-- 이 폴더의 파일들은 원본 작업 코드에서 복사 / 정리된 코드입니다.
-- 여기서 수정해도 원본 위치가 자동으로 같이 바뀌지는 않습니다.
-- 경로는 가능한 한 `DATA_ROOT`, `RUNS_ROOT` 환경변수로 주입해 기본값 (`./data/ceramics`, `./runs`) 위에서 동작하도록 구성되어 있습니다.
-- 실제 이미지 / 라벨 데이터는 저장소에 포함하지 않습니다. 동일한 폴더 구조에 직접 넣어 실행하는 구조입니다.
-- 모델 파일 `model.py` 에는 실험 과정에서 사용한 다양한 AE / RAE 변형이 함께 들어 있지만, 현재 기본 설정은 `AE_high` 한 가지만 사용합니다.
-
-## 폴더 구성
+## 동작 방식
 
 ```text
-industrial-draem-anomaly-segmentation/
-├── preprocess/                      # 전처리 / augmentation / 패치 추출
-│   ├── pipeline.py                  # FFT central-crop + post-processing 공용 모듈
-│   ├── augment.py                   # PIL/NumPy 기반 augmentation (basic/full 모드)
-│   ├── preprocess_all.py            # 여러 폴더 → train/val split
-│   ├── preprocess_test.py           # test 폴더 전처리
-│   ├── augment_dataset.py           # train 폴더에 대해 이미지당 N장 증강
-│   ├── extract_defect_patches.py    # LabelMe JSON → alpha 마스크 결함 패치
-│   └── README.md
-├── config.py                        # DATA_ROOT/RUNS_ROOT 기반 경로 및 하이퍼파라미터
-├── train.py                         # DRAEM 학습 엔트리 (argparse)
-├── test.py                          # DRAEM 추론 + 시각화 엔트리 (argparse)
-├── data.py                          # DataLoader 래퍼 (train/valid/test)
-├── data_loader_black.py             # Custom Dataset (결함 patch + Perlin noise 합성)
-├── model.py                         # AE / AE_high / RAE 등 AutoEncoder 구현
-├── model_unet.py                    # DiscriminativeSubNetwork (U-Net)
-├── loss.py                          # FocalLoss + SSIM
-├── perlin.py                        # Perlin noise 생성기
-├── tensorboard_visualizer.py        # 이미지 / loss 로그 어댑터
-├── util.py                          # run name, resume, scheduler 복원 등 유틸
-├── experiments/
-│   └── tile_v4/                     # 후속 실험: 1024 타일 + DINOv3 인코더 분할 (README 참고)
-├── requirements.txt
-└── README.md
+1. 원본 grayscale 이미지 → FFT 노이즈 제거 + 대비 보정 + 640x640 리사이즈   (preprocess/)
+2. 소량의 결함 라벨 (LabelMe polygon) → 투명 배경 결함 패치 PNG 추출
+3. 학습 시 정상 이미지에 가짜 결함 합성: 실제 결함 패치 50% / Perlin noise 50%
+4. 재구성 AE (AE_high): 결함이 섞인 입력 → 깨끗한 정상 이미지로 복원
+5. 분할 U-Net: [복원 이미지, 입력 이미지] 2채널을 비교 → 결함 마스크 예측
+6. 추론: 테스트 이미지 → 결함 확률맵 + 4분할 시각화 + AUC/AP 기록
 ```
 
-### `preprocess/`
+- **왜 두 개의 네트워크인가**: AE는 정상만 복원하도록 배우기 때문에 결함 부위를 "정상처럼" 지워서 복원합니다. 입력과 복원의 차이가 결함 단서가 되고, U-Net이 이 차이를 보고 위치를 마스크로 그립니다.
+- **가짜 결함 ① 실제 패치**: 결함 패치 1~3개를 0.5~2.5배 스케일, 회전, flip, elastic/perspective 변형 후 soft-edge 또는 DRAEM 방식으로 블렌딩합니다.
+- **가짜 결함 ② Perlin noise**: 가는 crack 50% / 원형 반점 25% / 불규칙 blob 25%로 만들고, 부품의 원형 유효 영역 안에만 배치합니다.
+- **정상 샘플 유지**: 학습 샘플의 50%는 결함 없이 그대로 넣어, 정상 이미지에서 결함을 잘못 찾지 않도록 균형을 맞춥니다.
+- **손실**: 복원은 MSE + SSIM, 분할은 Focal loss. 두 네트워크를 하나의 optimizer로 동시에 학습합니다.
 
-원본 이미지 → 학습용 이미지로 바꾸는 전처리 전담 폴더입니다.
+## 시도와 개선 과정
 
-- `pipeline.py`: FFT central-crop (radius 170, padding 8, 640x640 resize) + Gaussian / Median / Wiener / Contrast stretch / Gamma / Unsharp mask 후처리. 모든 스크립트가 이 모듈을 import 해서 공유합니다.
-- `augment.py`: flip / rotate / brightness / contrast / (옵션) blur / noise / elastic / CLAHE / erasing. `mode="basic"` 과 `mode="full"` 두 가지 프리셋 제공.
-- `preprocess_all.py`: 여러 입력 폴더를 한 번에 전처리해서 `train/` 과 `val/` 로 랜덤 split. 기본 val 비율 10%.
-- `preprocess_test.py`: 테스트 전용 (augmentation 없음).
-- `augment_dataset.py`: 이미 전처리된 train 폴더에 대해 이미지당 N장 augmentation 저장.
-- `extract_defect_patches.py`: LabelMe JSON polygon 을 읽어 `defect_patches/{crack,bow,other}/*.png` 로 alpha 채널 포함 RGBA 패치 저장. `data_loader_black.py` 가 학습 시 이 폴더를 결함 합성 소스로 사용합니다.
+| 단계 | 방법 | 이유 / 결과 |
+|---|---|---|
+| 전처리 정리 | 스크립트마다 중복되던 FFT·augmentation 코드를 `pipeline.py`, `augment.py` 공용 모듈로 통합 | 학습·테스트·패치 추출이 동일한 전처리를 공유 |
+| DRAEM 기본 (루트) | `AE_high` + `DiscriminativeSubNetwork`, 640x640 입력, 실제 패치 + Perlin 합성 | 결함 샘플 부족을 "정상 + 합성 결함"으로 우회 |
+| 재구성 모델 비교 | `model.py`에 `AE`, `AE_half`, `RAE` 계열, `U2NET`, `AE_ultra` 등 변형 구현 | 현재 기본 설정은 `AE_high` 하나만 사용 |
+| 학습 중 증강 조정 | Dataset 내부 Zoom/Elastic 증강 | 품질 저하 이슈로 비활성화 (코드에 주석으로 보존) |
+| Tile V4 (`experiments/tile_v4/`) | 1024 이미지를 512 타일 5장(overlap 64)으로 분할, 동결 DINOv3 ViT-L/16 인코더 + U-Net 디코더, Focal Tversky loss | 640 전체 이미지에서는 작은 결함이 다운샘플링으로 사라짐 → 고해상도 타일 + 사전학습 표현으로 보강, 미검(FN)에 더 큰 패널티 |
 
-자세한 사용법은 [preprocess/README.md](preprocess/README.md) 참고.
+> 저장소에는 단계별 성능 수치가 기록되어 있지 않아 결과 비교 수치는 적지 않았습니다.
 
-### `train.py` / `test.py`
-
-argparse 기반 엔트리 포인트입니다. `config.py` 의 기본값을 받되, CLI 인자로 덮어씁니다.
-
-- `train.py`: AE + U-Net 동시 학습, 매 epoch 에 epoch별 / latest / class별 / best 체크포인트를 저장.
-- `test.py`: 지정한 base model 이름을 받아 `.pckl` 체크포인트를 로드, 테스트 이미지에 대해 anomaly probability map 과 4분할 시각화 이미지, AUC / AP 지표를 함께 생성합니다.
-
-### `data_loader_black.py`
-
-학습 Dataset 본체. 주요 특징:
-
-- 1-channel (grayscale) 입력, 640x640 기준.
-- 결함 합성: 50% 확률로 `defect_patches/` 에서 실제 결함 patch 를 elastic + soft-edge 블렌딩, 50% 확률로 Perlin noise 기반 합성.
-- `augmented_image`, `anomaly_mask` 를 함께 반환해 U-Net 학습에 그대로 연결.
-
-### `model.py`
-
-AutoEncoder 변형들이 모여 있습니다 (`AE`, `AE_high`, `AE_half`, `AE_high_half`, `RAE` 계열, `U2NET`, `AE_ultra` 등). 실험 과정의 흔적이지만 현재 기본 설정은 `AE_high` 한 가지만 활성 상태입니다. 다른 모델로 바꾸고 싶으면 `--model_class_name` 인자 또는 `config.model_class_name` 값을 변경하면 됩니다.
-
-## 후속 실험: Tile V4 (`experiments/tile_v4/`)
-
-640x640 전체 이미지 학습에서는 작은 결함이 다운샘플링으로 사라지는 한계가 있어,
-1024 해상도를 512 타일(overlap 64)로 나누고 **동결된 DINOv3 ViT-L 인코더 + U-Net 디코더**로 직접 분할하는 구조를 실험했습니다.
-불균형이 심한 결함 픽셀에 맞춰 Focal Tversky loss(FN 가중)를 쓰고, 절차적 크랙 합성과 원형 영역 배치 제약을 추가했습니다.
-자세한 비교는 [experiments/tile_v4/README.md](experiments/tile_v4/README.md) 참고.
-
-## 처리 흐름
-
-```text
-원본 이미지 + LabelMe JSON
-    ↓
-preprocess/preprocess_all.py  (train/val split)
-preprocess/preprocess_test.py  (test)
-    ↓
-preprocess/augment_dataset.py  (이미지당 N장 augmentation)
-preprocess/extract_defect_patches.py  (결함 patch)
-    ↓
-train.py  (AE_high + DiscriminativeSubNetwork)
-    ↓
-checkpoints/*.pckl
-    ↓
-test.py  (AUC/AP 지표 + 4분할 시각화)
-```
-
-## 단계별 추천 사용 순서
-
-### 1. 데이터 루트 세팅
+## 빠른 시작
 
 ```bash
-export DATA_ROOT=./data/ceramics
-export RUNS_ROOT=./runs
+# requirements.txt 는 conda list 형식 (linux-64, Python 3.8 / PyTorch 1.8 / CUDA 10.2)
+conda create --name draem --file requirements.txt
+conda activate draem
 ```
 
-`$DATA_ROOT` 아래에 원본 이미지와 LabelMe JSON 이 들어가는 폴더들을 배치합니다. 기본 레이아웃 예시:
+데이터와 체크포인트는 포함되어 있지 않습니다. `$DATA_ROOT` 아래에 직접 아래처럼 배치합니다.
 
 ```text
 $DATA_ROOT/
-├── train_g2_orig_ok/           # 정상 샘플 (원본)
-├── train_g2_orig_ok_new/
-├── train_g3_orig_ok/
-├── train_g3_orig_ok_new/
-├── test_orig/                  # 테스트 원본 + LabelMe JSON
-├── train/                      # 전처리 + augmentation 결과 (생성됨)
-├── val/                        # 전처리 split 결과 (생성됨)
-├── test/                       # 전처리된 테스트 이미지 (생성됨)
-└── defect_patches/             # 결함 patch (생성됨)
-    ├── crack/
-    ├── bow/
-    └── other/
+├── <정상 원본 폴더들>/            # INPUT_FOLDERS 환경변수로 지정
+├── test_orig/                     # 테스트 원본 + LabelMe JSON (결함 패치 소스)
+├── train/  val/  test/            # 전처리 결과 (생성됨)
+└── defect_patches/{crack,bow,other}/   # 결함 패치 (생성됨)
 ```
-
-### 2. 전처리 + split
 
 ```bash
-python preprocess/preprocess_all.py     # train_g* → train/ + val/
-python preprocess/preprocess_test.py    # test_orig → test/
+export DATA_ROOT=./data                                   # 기본값: ./data/ceramics
+export INPUT_FOLDERS="$DATA_ROOT/normal_a:$DATA_ROOT/normal_b"   # ':' 구분
+
+# 1) 전처리
+python preprocess/preprocess_all.py           # 정상 원본 → train/ + val/ (val 10%)
+python preprocess/preprocess_test.py          # test_orig/ → test/
+python preprocess/extract_defect_patches.py   # LabelMe JSON → defect_patches/
+# (선택) 원본 폴더 하나를 전처리 + 이미지당 N장 증강해 train/ 에 추가
+AUG_INPUT="$DATA_ROOT/normal_a" AUG_COUNT=14 python preprocess/augment_dataset.py
+
+# 2) 학습 (체크포인트 이름 prefix: DRAEM_AE_high_640_0.0001_700_bs2_)
+python train.py --bs 2 --lr 0.0001 --epochs 700 \
+  --data_path "$DATA_ROOT/train/*.jpg" --valid_path "$DATA_ROOT/val/*.jpg" \
+  --anomaly_source_path "$DATA_ROOT/defect_patches" \
+  --checkpoint_path ./checkpoints --log_path ./logs --visualize
+# 재개: 같은 인자 + --resume auto (또는 --resume <체크포인트 경로>)
+
+# 3) 추론 + 시각화
+python test.py --base_model_name DRAEM_AE_high_640_0.0001_700_bs2_best \
+  --data_path "$DATA_ROOT/test" --checkpoint_path ./checkpoints \
+  --save_dir ./runs/images --csv_path ./runs/DRAEM_result.csv
 ```
 
-환경변수로 오버라이드:
+- `--anomaly_source_path`를 생략하면 실행 위치 기준 `./defect_patches/{crack,bow}`, `../defect_patches/{crack,bow}`만 자동 탐색합니다. 패치가 하나도 없으면 Perlin 합성만 사용합니다.
+- AUC/AP 계산에는 MVTec 형식 폴더가 필요합니다: `test/good/`, `test/<결함종류>/`, 그리고 `test/`와 같은 위치의 `ground_truth/<결함종류>/<이름>_mask.png`. 정상/결함 두 클래스가 없으면 시각화만 저장하고 지표 계산은 건너뜁니다.
+- GPU가 없으면 MPS(Apple Silicon) 또는 CPU로 자동 전환됩니다. TensorBoard: `tensorboard --logdir logs/`.
 
-- `INPUT_FOLDERS`: 입력 폴더 목록 (`:` 구분).
-- `VAL_RATIO`: val 비율 (기본 0.1).
-- `NUM_WORKERS`: 병렬 워커 수.
+## 폴더 구조
 
-### 3. 결함 patch 추출
-
-```bash
-python preprocess/extract_defect_patches.py
+```text
+.
+├── preprocess/                  # 전처리 / augmentation / 결함 패치 추출 (자세한 내용: preprocess/README.md)
+│   ├── pipeline.py              # FFT central-crop + 후처리 공용 모듈
+│   ├── augment.py               # augmentation (basic / full 모드)
+│   ├── preprocess_all.py        # 여러 정상 폴더 → train/val split
+│   ├── preprocess_test.py       # 테스트 폴더 전처리
+│   ├── augment_dataset.py       # 원본 폴더 전처리 + 이미지당 N장 증강
+│   └── extract_defect_patches.py  # LabelMe JSON → alpha 마스크 결함 패치
+├── config.py                    # DATA_ROOT / RUNS_ROOT 기반 경로와 기본 하이퍼파라미터
+├── train.py                     # 학습 엔트리 (AE + U-Net 동시 학습, resume, 체크포인트)
+├── test.py                      # 추론 엔트리 (확률맵, 4분할 시각화, AUC/AP)
+├── data.py                      # DataLoader 래퍼
+├── data_loader_black.py         # 학습/검증/테스트 Dataset (결함 합성 로직 핵심)
+├── model.py                     # AE_high 등 재구성 AE 변형 모음
+├── model_unet.py                # DiscriminativeSubNetwork (분할 U-Net)
+├── loss.py                      # FocalLoss, SSIM
+├── perlin.py                    # Perlin noise 생성
+├── tensorboard_visualizer.py    # TensorBoard 이미지 / loss 로깅
+├── util.py                      # run name, resume, scheduler 복원, 결과 CSV
+├── experiments/tile_v4/         # 후속 실험: 512 타일 + DINOv3 분할 (README 참고)
+└── requirements.txt             # conda 환경 정의
 ```
 
-LabelMe JSON 의 polygon 을 학습 데이터와 동일한 FFT 전처리로 정렬한 뒤 alpha 채널 마스크로 잘라 저장합니다.
-`PATCH_INPUT_DIR`, `PATCH_OUTPUT_DIR`, `PATCH_PADDING` 환경변수로 경로 / 패딩을 조정할 수 있습니다.
+## 기술 상세
 
-### 4. Augmentation (선택)
+<details>
+<summary>전처리 파라미터 (preprocess/pipeline.py, augment.py)</summary>
 
-```bash
-python preprocess/augment_dataset.py
-```
+- Grayscale 변환 → reflection padding(`PAD=8`) 후 FFT, 중심 반경 `CROP_R=170` 영역만 남겨 고주파 노이즈 제거 → 역FFT → 원본 mean/std로 tone matching
+- 후처리 순서: Gaussian blur(`sigma=1.0`) → Median(`k=3`) → 국소 Wiener(`ksize=5`, `noise_var=100.0`) → contrast stretch(10~97 percentile) → gamma(`1.4`) → unsharp mask(`amount=2.2`, `sigma=0.5`) → `640x640` 리사이즈
+- Augmentation: 항상 flip(상하/좌우 각 50%) + ±180° 회전, 50% 확률 brightness/contrast. `full` 모드에서만 blur / noise / elastic / CLAHE / random erasing (각 30%). `augment_dataset.py` 기본은 `basic`
+- 결함 패치: polygon 라벨에 `crack` 포함 → `crack/`, `bow` 포함 → `bow/`, 나머지 → `other/`. 기본 패딩 25px
+</details>
 
-이미 전처리된 train 폴더에 이미지당 N장 증강본을 추가 저장합니다.
-`AUG_INPUT`, `AUG_OUTPUT`, `AUG_COUNT` (기본 14), `AUG_MODE` (`basic` / `full`) 환경변수로 동작을 바꿀 수 있습니다.
+<details>
+<summary>모델 · 손실 · 학습 설정</summary>
 
-### 5. 학습
+- **재구성**: `AE_high` — encoder 6단계(1→32→64→128→256→512→1024 채널, ResidualBlock + MaxPool), 대칭 decoder(bicubic upsample + ResidualBlock), 출력 Sigmoid
+- **분할**: `DiscriminativeSubNetwork` — 입력 2채널(복원 + 입력), 출력 2채널(정상/결함), base channels 64
+- **손실**: `MSE(recon, 원본) + SSIM(recon, 원본) + Focal(seg, mask)`
+- **기본값 (`config.py`)**: optimizer `adamw`, scheduler `plateau`(검증 SSIM loss 기준, factor 0.5, patience 10), init `xavier`, lr 0.001, batch 6, epochs 1000. `--optimizer_type`, `--scheduler_type`(`step`/`cosine` 가능), `--init_type`, `--model_class_name`으로 변경
+- 다른 재구성 모델은 `--model_class_name`으로 선택 (`AE`, `AE_half`, `AE_high_half`, `RAE`, `RAE_high`, `U2NET`, `AE_ultra` 등)
+</details>
 
-```bash
-python train.py \
-    --bs 2 --lr 0.0001 --epochs 700 \
-    --data_path "$DATA_ROOT/train/*.jpg" \
-    --valid_path "$DATA_ROOT/val/*.jpg" \
-    --checkpoint_path ./checkpoints \
-    --log_path ./logs \
-    --visualize
-```
+<details>
+<summary>합성 결함 상세 (data_loader_black.py · CustomDRAEMTrainDataset)</summary>
 
-재개 (resume) 는 다음 중 하나를 사용합니다.
+- **실제 패치 모드 (50%)**: RGBA 패치 1~3개 로드 → scale 0.5~2.5x → rotation → flip → elastic(30%) → perspective(20%) → 랜덤 위치 배치. 블렌딩은 50% soft-edge(마스크 Gaussian blur, `beta` 0.6~1.0), 50% 원본 DRAEM 방식(`beta` 0~0.8). 마스크는 패치별 최대값으로 합침
+- **Perlin 모드 (50%)**: scale 2^0~2^5 Perlin noise를 ±90° 회전 후 crack(|noise| < 0.02~0.08) 50% / 반지름 5~50px 원 25% / blob(noise > 0.5) 25%. 이미지 중심 기준 반지름 90% 원 밖은 마스크 제거, 결함 영역은 어둡게 블렌딩
+- **결함 없음 샘플**: 최종 50% 확률로 원본과 빈 마스크를 반환
+- 반환값: `image`(복원 목표), `augmented_image`(합성 입력), `anomaly_mask`, `has_anomaly`
+</details>
 
-```bash
-python train.py ... --resume auto                   # 가장 최근 epoch 체크포인트 자동 선택
-python train.py ... --resume ./checkpoints/...pckl  # 특정 파일 지정
-```
+<details>
+<summary>출력물 · 지표 · 체크포인트</summary>
 
-매 epoch 에 다음 파일들이 저장됩니다.
+- **확률맵 / 지표**: U-Net 결함 확률을 pixel score로, 21x21 평균 풀링 후 최댓값을 image score로 사용 → image/pixel AUC·AP를 `--csv_path`에 한 줄 추가 (`run_name,img_auc,pixel_auc,img_ap,pixel_ap`)
+- **시각화**: `save_dir/{idx}_combined.png` = Input / Recon / Prob / Result. Prob은 `0.5*(1-SSIM) + 0.5*상대 복원오차` heatmap, Result는 이 맵(밝기 비례 임계값)과 U-Net 맵(> 0.1)의 AND 영역에 contour + bbox 표시 (10px 미만 파편 제외)
+- **체크포인트 (매 epoch)**: `{run_name}epoch{N}.pckl` / `_seg.pckl`, optimizer·scheduler 포함 `{run_name}epoch{N}_full.pckl`, latest `{run_name}.pckl` / `_seg.pckl`, 클래스명 기반 `AE_high.pckl` / `AE_high_seg.pckl`. 검증 SSIM loss 갱신 시 `{run_name}best.pckl` / `best_seg.pckl`, `AE_high_best.pckl` / `_best_seg.pckl`
+- `run_name` 규칙: `DRAEM_{model}_640_{lr}_{epochs}_bs{bs}_` (`util.build_run_name`)
+</details>
 
-- `{run_name}epoch{N}.pckl`, `{run_name}epoch{N}_seg.pckl`: epoch 단위 가중치.
-- `{run_name}epoch{N}_full.pckl`: optimizer / scheduler / best_ssim / n_iter 포함 full checkpoint.
-- `{run_name}.pckl`, `{run_name}_seg.pckl`: 최신 latest.
-- `{model_class_name}.pckl`, `{model_class_name}_seg.pckl`: 클래스명 기반 latest.
-- `{run_name}best.pckl`, `{model_class_name}_best.pckl`: 검증 SSIM loss 가 갱신될 때만 추가 저장.
+<details>
+<summary>전처리 환경변수</summary>
 
-### 6. 추론 + 시각화
+| 변수 | 기본값 | 사용 스크립트 |
+|---|---|---|
+| `DATA_ROOT` | `./data/ceramics` | 전체 (`config.py` 포함) |
+| `RUNS_ROOT` | `./runs` | `config.py` |
+| `INPUT_FOLDERS`, `TRAIN_OUTPUT`, `VAL_OUTPUT`, `VAL_RATIO` | 코드 내 기본 폴더 4종, `$DATA_ROOT/train`, `$DATA_ROOT/val`, `0.1` | `preprocess_all.py` |
+| `TEST_INPUT`, `TEST_OUTPUT` | `$DATA_ROOT/test_orig`, `$DATA_ROOT/test` | `preprocess_test.py` |
+| `AUG_INPUT`, `AUG_OUTPUT`, `AUG_COUNT`, `AUG_MODE` | 코드 내 기본 폴더, `$DATA_ROOT/train`, `14`, `basic` | `augment_dataset.py` |
+| `PATCH_INPUT_DIR`, `PATCH_OUTPUT_DIR`, `PATCH_PADDING` | `$DATA_ROOT/test_orig`, `$DATA_ROOT/defect_patches`, `25` | `extract_defect_patches.py` |
+| `NUM_WORKERS` | CPU 코어 수 (`preprocess_all.py`는 최대 8) | 전처리 공통 |
+</details>
 
-```bash
-python test.py \
-    --base_model_name DRAEM_AE_high_640_0.0001_700_bs2_ \
-    --data_path "$DATA_ROOT/test" \
-    --checkpoint_path ./checkpoints \
-    --save_dir ./runs/images \
-    --csv_path ./runs/DRAEM_result.csv
-```
+<details>
+<summary>후속 실험: Tile V4 요약</summary>
 
-결과:
+- 입력: 1024x1024 → 512 타일 5장 (4코너 + 중앙, overlap 64). 추론은 `TileInferenceDataset` + `stitch_tiles`로 원본 해상도 복원
+- 모델: `vit_large_patch16_dinov3.lvd1689m` (timm) 인코더 동결(`--freeze_encoder`, 기본 on) + U-Net 스타일 디코더, AdamW + CosineAnnealingLR
+- 손실: Focal Tversky (α=0.85, β=0.15, γ=0.75) — 미검(FN)에 더 큰 패널티
+- 합성: 실제 패치 + 절차적 crack, 원형 제품 영역 제약, 중첩 방지, epoch별 강도 스케줄(`set_epoch`)
+- 검증: 실제 결함 이미지에 대한 IoU / Dice. 실행 예시와 비교표는 [experiments/tile_v4/README.md](experiments/tile_v4/README.md)
+</details>
 
-- `save_dir/{idx}_combined.png`: Input / Reconstructed / Probability heatmap / Overlay 4분할 이미지.
-- `csv_path`: run 단위 image AUC, pixel AUC, image AP, pixel AP.
+## 한계와 다음 단계
 
-## 가장 먼저 기억할 파일
+- **결과 수치 비공개**: 데이터·체크포인트·성능 수치가 없어 이 저장소만으로는 결과를 재현할 수 없습니다. 공개 데이터셋(예: MVTec AD)으로 동일 파이프라인을 재현하는 것이 다음 단계입니다.
+- **작은 결함 소실**: 640x640 다운샘플링 한계는 tile_v4에서 실험했지만 루트 파이프라인과 통합되지 않았고, tile_v4는 별도 추론 스크립트 없이 학습 중 검증에서만 타일 stitching을 수행합니다. timm·DINOv3 가중치는 `requirements.txt`에 포함되어 있지 않습니다.
+- **데이터 특화 설정**: FFT 파라미터(`CROP_R=170`, `PAD=8`), 원형 유효 영역, 시각화 임계값은 원본 촬영 조건에 맞춘 수동 튜닝 값이라 다른 데이터에서는 재조정이 필요합니다.
+- **오래된 환경 고정**: `requirements.txt`는 Python 3.8 / PyTorch 1.8 / CUDA 10.2 시점 conda 스냅샷이며, 최신 환경 이식은 검증하지 않았습니다.
 
-- `preprocess/pipeline.py`
-  - 전체 파이프라인의 FFT + 후처리 공용 모듈 (전 스크립트가 공유).
+## 참고
 
-- `preprocess/extract_defect_patches.py`
-  - LabelMe 어노테이션을 학습 친화적인 결함 patch 로 바꾸는 진입점.
-
-- `train.py`
-  - AE + U-Net 동시 학습의 메인 엔트리.
-
-- `data_loader_black.py`
-  - 실제 결함 patch 와 Perlin noise 를 블렌딩해 `augmented_image` 와 `anomaly_mask` 를 만드는 핵심 Dataset.
-
-- `test.py`
-  - Anomaly map 시각화와 AUC / AP 지표 계산.
-
-## 환경 메모
-
-- `requirements.txt` 는 conda list 형식으로 정리되어 있습니다 (`conda create --name <env> --file requirements.txt`). pip 기반 환경이라면 `python=3.8`, `pytorch=1.8`, `torchvision=0.9`, `opencv-python`, `imgaug`, `scikit-learn`, `scikit-image`, `tensorboard`, `imageio`, `numpy`, `pillow` 수준으로 맞추면 됩니다.
-- GPU 가 없으면 `train.py` / `test.py` 는 자동으로 MPS (Apple Silicon) 또는 CPU 로 떨어집니다. 하지만 학습 시간은 CUDA 기준으로 설계되어 있습니다.
-- TensorBoard 를 쓰려면 `--visualize` 옵션을 주고 `tensorboard --logdir logs/` 로 열면 됩니다.
-- 체크포인트 / 로그 / 생성 이미지는 `.gitignore` 로 기본 제외되어 있습니다.
-
-## 메모
-
-- 이 폴더는 전체 파이프라인을 빠르게 이해하기 위한 정리본입니다.
-- 원본 코드가 나중에 바뀌어도 이 정리본이 자동 동기화되지는 않습니다.
-- 데이터, 체크포인트, one-off 로그는 저장소에 포함하지 않는 구성이 자연스럽습니다.
-- 참고 논문: DRAEM - Zavrtanik et al., "DRAEM - A discriminatively trained reconstruction embedding for surface anomaly detection", ICCV 2021.
+- Zavrtanik et al., "DRAEM — A discriminatively trained reconstruction embedding for surface anomaly detection", ICCV 2021.
+- Focal Loss: Lin et al., [arXiv:1708.02002](https://arxiv.org/abs/1708.02002) (`loss.py` 구현 출처 주석 참고)

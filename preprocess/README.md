@@ -12,7 +12,7 @@ preprocess/
 ├── augment.py                  # PIL/NumPy 기반 augmentation (basic/full 모드)
 ├── preprocess_all.py           # 여러 폴더 → train/val split (multiprocessing)
 ├── preprocess_test.py          # test 폴더 전처리 (augmentation 없음)
-├── augment_dataset.py          # 전처리된 폴더에 대해 이미지당 N장 증강
+├── augment_dataset.py          # 원본 폴더 전처리 + 이미지당 N장 증강
 ├── extract_defect_patches.py   # LabelMe JSON → alpha 마스크 결함 패치
 └── README.md
 ```
