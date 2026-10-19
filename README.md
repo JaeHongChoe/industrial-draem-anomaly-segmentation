@@ -1,13 +1,38 @@
-# Industrial DRAEM Anomaly Segmentation
+# Semiconductor Parts Anomaly Segmentation
 
-DRAEM 기반 AutoEncoder + Discriminative U-Net으로 산업 이미지의 anomaly map과 제품 단위 불량 판정을 수행하는 이상탐지 파이프라인입니다.
+반도체 부품 이미지에서 결함 후보를 분할하고 제품 단위 불량 판정을 보조하기 위한 이상 탐지 파이프라인입니다.
 
-이 저장소는 `원본 이미지 전처리 → 결함 패치 추출 → DRAEM 기반 AutoEncoder + Discriminative U-Net 학습 → 추론 / 시각화`
-흐름을 한곳에서 볼 수 있도록 정리한 코드 묶음입니다.
+이 저장소는 `원본 이미지 전처리 → 결함 패치 추출 → 정상 이미지 기반 재구성 모델 학습 → 가성 결함 패치 기반 분할 학습 → 추론 / 시각화`
+흐름을 한곳에서 볼 수 있도록 정리한 코드 묶음입니다. 실제 이미지와 라벨 데이터는 보안상 포함하지 않습니다.
 
-핵심 목적은 **정상 샘플만으로 깨끗한 이미지 재구성을 학습시키고,
-실제 결함 패치 + Perlin noise 로 만든 합성 이상을 Segmentation 네트워크로 분리하도록 해서
-제품 단위 양품 / 불량 판정과 pixel-level anomaly map 을 동시에 얻는 것**입니다.
+핵심 목적은 **정상 샘플로 깨끗한 이미지를 재구성하고, 실제 결함 패치와 가성 결함 패치를 정상 이미지에 합성해 결함 위치를 분할하도록 학습시키는 것**입니다.
+
+## Project Snapshot
+
+- Domain: 반도체 부품 비전 검사 / 결함 탐지
+- Problem: 결함 샘플이 적고 제품 종류가 다양해, 단일 제품·단일 모델 가정의 방법론을 그대로 쓰기 어려움
+- Approach: DRAEM의 "정상 재구성 + 합성 결함 분할" 학습 아이디어를 가져오되, 다품종 단일 모델 환경에 맞춰 AE 기반 재구성 구조와 결함 패치 합성 로직을 구성
+- Output: anomaly probability map, input/reconstruction/probability/overlay 4분할 시각화, image/pixel 단위 평가 지표
+- Scope: 공개 가능한 코드 구조와 학습/평가 흐름 정리. 실제 데이터와 체크포인트는 포함하지 않음
+
+## What to Review First
+
+평가자가 빠르게 구조를 보려면 아래 파일부터 보면 됩니다.
+
+1. `preprocess/pipeline.py`  
+   X-ray/비전 이미지의 FFT central-crop, 노이즈 제거, 대비 보정, sharpening 등 공용 전처리 흐름입니다.
+
+2. `preprocess/extract_defect_patches.py`  
+   LabelMe polygon annotation을 alpha mask가 포함된 결함 패치로 변환합니다.
+
+3. `data_loader_black.py`  
+   정상 이미지 위에 실제 결함 패치 또는 합성 결함을 배치해 학습용 image/mask pair를 생성합니다.
+
+4. `model.py`, `model_unet.py`  
+   정상 이미지 재구성용 AE 계열 모델과 anomaly mask 분할용 U-Net 계열 모델입니다.
+
+5. `train.py`, `test.py`  
+   학습, checkpoint/resume, TensorBoard 시각화, AUC/AP 계산, 4분할 결과 저장까지 이어지는 실행 엔트리입니다.
 
 ## 접근 배경
 
@@ -68,6 +93,8 @@ industrial-draem-anomaly-segmentation/
 ├── perlin.py                        # Perlin noise 생성기
 ├── tensorboard_visualizer.py        # 이미지 / loss 로그 어댑터
 ├── util.py                          # run name, resume, scheduler 복원 등 유틸
+├── experiments/
+│   └── tile_v4/                     # 후속 실험: 1024 타일 + DINOv3 인코더 분할 (README 참고)
 ├── requirements.txt
 └── README.md
 ```
@@ -103,6 +130,13 @@ argparse 기반 엔트리 포인트입니다. `config.py` 의 기본값을 받�
 ### `model.py`
 
 AutoEncoder 변형들이 모여 있습니다 (`AE`, `AE_high`, `AE_half`, `AE_high_half`, `RAE` 계열, `U2NET`, `AE_ultra` 등). 실험 과정의 흔적이지만 현재 기본 설정은 `AE_high` 한 가지만 활성 상태입니다. 다른 모델로 바꾸고 싶으면 `--model_class_name` 인자 또는 `config.model_class_name` 값을 변경하면 됩니다.
+
+## 후속 실험: Tile V4 (`experiments/tile_v4/`)
+
+640x640 전체 이미지 학습에서는 작은 결함이 다운샘플링으로 사라지는 한계가 있어,
+1024 해상도를 512 타일(overlap 64)로 나누고 **동결된 DINOv3 ViT-L 인코더 + U-Net 디코더**로 직접 분할하는 구조를 실험했습니다.
+불균형이 심한 결함 픽셀에 맞춰 Focal Tversky loss(FN 가중)를 쓰고, 절차적 크랙 합성과 원형 영역 배치 제약을 추가했습니다.
+자세한 비교는 [experiments/tile_v4/README.md](experiments/tile_v4/README.md) 참고.
 
 ## 처리 흐름
 

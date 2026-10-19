@@ -8,3 +8,5 @@ logs/
 *.log
 .DS_Store
 ._*
+defect_patches*/
+data/
